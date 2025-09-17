@@ -24,7 +24,7 @@ LOG_FILE = "log_servidor.txt"
 
 
 # ==============================================================================
-# 1. Lógica das Threads (Impressoras) - COM LOCK EXPLÍCITO (Mantido)
+# 1. Lógica das Threads (Impressoras)
 # ==============================================================================
 def printer_worker(thread_id: int, job_queue: collections.deque, condition: threading.Condition,
                    log_queue: multiprocessing.Queue):
@@ -35,7 +35,7 @@ def printer_worker(thread_id: int, job_queue: collections.deque, condition: thre
     while True:
         job = None
 
-        # --- SEÇÃO CRÍTICA INICIA AQUI ---
+
         with condition:  # 'with' adquire e libera o lock automaticamente
             # Espera enquanto a fila estiver vazia E o sinal de parada não for o job atual
             while not job_queue:
@@ -44,7 +44,7 @@ def printer_worker(thread_id: int, job_queue: collections.deque, condition: thre
 
                 # Quando acordar, o lock é readquirido. Pega o trabalho.
             job = job_queue.popleft()
-        # --- SEÇÃO CRÍTICA TERMINA AQUI ---
+
 
         if job is None:
             log_queue.put(f"[Impressora {thread_id}] Recebeu sinal de desligamento. Encerrando.")
@@ -59,7 +59,7 @@ def printer_worker(thread_id: int, job_queue: collections.deque, condition: thre
 
 
 # ==============================================================================
-# 2. Lógica do Processo Servidor (Gerenciador de Impressão) - (Mantido)
+# 2. Lógica do Processo Servidor (Gerenciador de Impressão)
 # ==============================================================================
 def log_manager(log_queue: multiprocessing.Queue):
     with open(LOG_FILE, "w") as f:
@@ -125,7 +125,7 @@ def servidor_process(ipc_queue: multiprocessing.Queue):
 
 
 # ==============================================================================
-# 3. Lógica do Processo Cliente - (Mantido)
+# 3. Lógica do Processo Cliente
 # ==============================================================================
 def cliente_process(client_id: int, ipc_queue: multiprocessing.Queue):
     print(f"[Cliente {client_id} PID: {os.getpid()}] Iniciado.")
@@ -142,7 +142,7 @@ def cliente_process(client_id: int, ipc_queue: multiprocessing.Queue):
 
 
 # ==============================================================================
-# 4. Orquestração Principal - REVERTIDO PARA multiprocessing.Process
+# 4. Orquestração Principal
 # ==============================================================================
 if __name__ == "__main__":
     print("--- Iniciando Simulação do Spooler de Impressão ---")
