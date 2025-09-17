@@ -3,8 +3,9 @@ import threading
 import time
 import random
 import os
-from queue import Queue, Empty
+import sys
 from dataclasses import dataclass
+import collections
 
 
 # --- Estrutura do Trabalho de Impressão ---
@@ -16,171 +17,155 @@ class TrabalhoImpressao:
 
 
 # --- Constantes de Configuração ---
-NUM_CLIENTES = 3
-NUM_IMPRESSORAS = 2
+NUM_CLIENTES = 10
+NUM_IMPRESSORAS = 5
 JOBS_POR_CLIENTE = 2
 LOG_FILE = "log_servidor.txt"
 
 
 # ==============================================================================
-# 1. Lógica das Threads (Impressoras)
+# 1. Lógica das Threads (Impressoras) - COM LOCK EXPLÍCITO (Mantido)
 # ==============================================================================
-def printer_worker(thread_id: int, job_queue: Queue, log_queue: Queue):
+def printer_worker(thread_id: int, job_queue: collections.deque, condition: threading.Condition,
+                   log_queue: multiprocessing.Queue):
     """
-    Função executada por cada thread de impressora.
-    Consome trabalhos da fila e simula a impressão.
+    Função da impressora usando um lock explícito e uma variável de condição.
     """
     log_queue.put(f"[Impressora {thread_id}] Online e pronta.")
     while True:
-        try:
-            # Pega um trabalho da fila. O 'block=True' faz a thread esperar
-            # se a fila estiver vazia. O timeout evita bloqueio infinito.
-            job = job_queue.get(block=True, timeout=1)
+        job = None
 
-            # Condição de parada: se o job for None, a thread deve terminar.
-            if job is None:
-                log_queue.put(f"[Impressora {thread_id}] Recebeu sinal de desligamento. Encerrando.")
-                break
+        # --- SEÇÃO CRÍTICA INICIA AQUI ---
+        with condition:  # 'with' adquire e libera o lock automaticamente
+            # Espera enquanto a fila estiver vazia E o sinal de parada não for o job atual
+            while not job_queue:
+                # Espera por uma notificação. O lock é liberado enquanto espera.
+                condition.wait()
 
-            log_queue.put(
-                f"[Impressora {thread_id}] Começou a imprimir Job #{job.id_job} ({job.nome_arquivo}, {job.numero_paginas} pág.)")
+                # Quando acordar, o lock é readquirido. Pega o trabalho.
+            job = job_queue.popleft()
+        # --- SEÇÃO CRÍTICA TERMINA AQUI ---
 
-            # Simula o tempo de impressão (0.1 segundo por página)
-            time.sleep(job.numero_paginas * 0.1)
+        if job is None:
+            log_queue.put(f"[Impressora {thread_id}] Recebeu sinal de desligamento. Encerrando.")
+            break
 
-            log_queue.put(f"[Impressora {thread_id}] Concluiu a impressão do Job #{job.id_job}")
-            job_queue.task_done()  # Sinaliza que o trabalho foi concluído
+        log_queue.put(
+            f"[Impressora {thread_id}] Começou a imprimir Job #{job.id_job} ({job.nome_arquivo}, {job.numero_paginas} pág.)")
+        time.sleep(job.numero_paginas * 0.1)
+        log_queue.put(f"[Impressora {thread_id}] Concluiu a impressão do Job #{job.id_job}")
 
-        except Empty:
-            # Se a fila continuar vazia após o timeout, continua esperando.
-            # Isso é útil para quando não há mais jobs mas o servidor ainda não mandou o sinal de parada.
-            continue
     log_queue.put(f"[Impressora {thread_id}] Offline.")
 
 
 # ==============================================================================
-# 2. Lógica do Processo Servidor (Gerenciador de Impressão)
+# 2. Lógica do Processo Servidor (Gerenciador de Impressão) - (Mantido)
 # ==============================================================================
-def log_manager(log_queue: Queue):
-    """
-    Uma thread dedicada para escrever no arquivo de log, evitando concorrência de I/O.
-    """
+def log_manager(log_queue: multiprocessing.Queue):
     with open(LOG_FILE, "w") as f:
         f.write("--- Início do Log do Servidor de Impressão ---\n")
-
     while True:
         message = log_queue.get()
-        if message is None:  # Sinal de parada
+        if message is None:
             break
-
         with open(LOG_FILE, "a") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
 
 
 def servidor_process(ipc_queue: multiprocessing.Queue):
-    """
-    Processo principal do servidor. Recebe trabalhos dos clientes,
-    gerencia a fila de impressão e as threads das impressoras.
-    """
     print(f"[Servidor PID: {os.getpid()}] Iniciado.")
 
-    # Fila interna para threads (impressoras) - é uma fila thread-safe
-    job_queue = Queue()
+    job_queue = collections.deque()
+    lock = threading.Lock()
+    condition = threading.Condition(lock)
 
-    # Fila para centralizar as mensagens de log
-    log_queue = Queue()
-
-    # Inicia a thread de gerenciamento de log
+    log_queue = multiprocessing.Queue()
     log_thread = threading.Thread(target=log_manager, args=(log_queue,))
     log_thread.start()
-
     log_queue.put(f"[Servidor] Servidor de impressão iniciado com {NUM_IMPRESSORAS} impressora(s).")
 
-    # Cria e inicia o pool de threads (impressoras)
     impressoras = []
     for i in range(NUM_IMPRESSORAS):
-        thread = threading.Thread(target=printer_worker, args=(i + 1, job_queue, log_queue))
+        thread = threading.Thread(target=printer_worker, args=(i + 1, job_queue, condition, log_queue))
         thread.start()
         impressoras.append(thread)
 
-    # Loop para receber trabalhos dos clientes via IPC
     total_jobs_esperados = NUM_CLIENTES * JOBS_POR_CLIENTE
     jobs_recebidos = 0
     while jobs_recebidos < total_jobs_esperados:
         job: TrabalhoImpressao = ipc_queue.get()
         log_queue.put(f"[Servidor] Recebido Job #{job.id_job} ('{job.nome_arquivo}') do cliente.")
-        job_queue.put(job)  # Adiciona o trabalho à fila das impressoras
+
+        with condition:
+            job_queue.append(job)
+            condition.notify()
         jobs_recebidos += 1
 
     log_queue.put("[Servidor] Todos os trabalhos foram recebidos dos clientes.")
 
-    # Espera até que todos os trabalhos na fila tenham sido processados
-    job_queue.join()
+    while True:
+        with lock:
+            if not job_queue:
+                break
+        time.sleep(0.1)
+
     log_queue.put("[Servidor] Fila de impressão vazia. Desligando as impressoras...")
 
-    # Envia o sinal de parada (None) para cada thread de impressora
-    for _ in impressoras:
-        job_queue.put(None)
+    with condition:
+        for _ in impressoras:
+            job_queue.append(None)
+        condition.notify_all()
 
-    # Espera todas as threads de impressora terminarem
     for thread in impressoras:
         thread.join()
 
-    # Envia o sinal de parada para a thread de log e espera ela terminar
     log_queue.put(None)
     log_thread.join()
-
     print(f"[Servidor PID: {os.getpid()}] Encerrado.")
 
 
 # ==============================================================================
-# 3. Lógica do Processo Cliente
+# 3. Lógica do Processo Cliente - (Mantido)
 # ==============================================================================
 def cliente_process(client_id: int, ipc_queue: multiprocessing.Queue):
-    """
-    Processo cliente que gera e envia trabalhos de impressão para o servidor.
-    """
     print(f"[Cliente {client_id} PID: {os.getpid()}] Iniciado.")
     for i in range(JOBS_POR_CLIENTE):
-        # Gera um trabalho de impressão com dados aleatórios
         job = TrabalhoImpressao(
-            id_job=client_id * 100 + i,  # ID único para o job
+            id_job=client_id * 100 + i,
             nome_arquivo=f"doc_cliente_{client_id}_job_{i}.pdf",
             numero_paginas=random.randint(1, 10)
         )
         print(f"[Cliente {client_id}] Enviando Job #{job.id_job} ({job.nome_arquivo}) para o servidor.")
         ipc_queue.put(job)
-        time.sleep(random.uniform(0.1, 0.5))  # Simula um intervalo entre envios
-
+        time.sleep(random.uniform(0.1, 0.5))
     print(f"[Cliente {client_id} PID: {os.getpid()}] Todos os trabalhos foram enviados.")
 
 
 # ==============================================================================
-# 4. Orquestração Principal
+# 4. Orquestração Principal - REVERTIDO PARA multiprocessing.Process
 # ==============================================================================
 if __name__ == "__main__":
     print("--- Iniciando Simulação do Spooler de Impressão ---")
 
-    # Cria a fila de comunicação entre processos (IPC)
-    # multiprocessing.Queue é segura para uso entre processos.
+    # A fila de comunicação entre processos funciona em todas as plataformas.
     fila_ipc = multiprocessing.Queue()
 
-    # 1. Inicia o processo do servidor
+    # 1. Inicia o processo do servidor usando a classe Process
     processo_servidor = multiprocessing.Process(target=servidor_process, args=(fila_ipc,))
     processo_servidor.start()
 
-    # 2. Inicia os processos dos clientes
+    # 2. Inicia os processos dos clientes usando a classe Process
     processos_clientes = []
     for i in range(NUM_CLIENTES):
         processo_cliente = multiprocessing.Process(target=cliente_process, args=(i + 1, fila_ipc))
         processos_clientes.append(processo_cliente)
         processo_cliente.start()
 
-    # 3. Espera todos os clientes terminarem de enviar seus trabalhos
+    # 3. Espera todos os clientes terminarem com .join()
     for p in processos_clientes:
         p.join()
 
-    # 4. Espera o servidor processar tudo e encerrar
+    # 4. Espera o servidor processar tudo e encerrar com .join()
     processo_servidor.join()
 
     print("\n--- Simulação Concluída ---")
